@@ -1,0 +1,73 @@
+[project]
+name = "jarvis"
+version = "0.1.0"
+description = "Voice-first JARVIS assistant on free AI, exposed to opencode as tools"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.15.0",
+    "fastapi>=0.141.1",
+    "uvicorn>=0.54.0",
+    "python-dotenv>=1.2.3",
+]
+
+# Heavy ML stacks live in extras so a base `uv sync` stays fast (~seconds, not GBs).
+[project.optional-dependencies]
+search = ["ddgs>=9.16.0", "tavily-python>=0.8.4"]
+memory = ["sqlite-vec>=0.1.9"]
+ocr = ["rapidocr-onnxruntime>=1.4.4"]
+stt = ["faster-whisper>=1.2.1", "onnxruntime>=1.30.0", "numpy>=2.5.3"]
+# CTranslate2 loads cuBLAS/cuDNN by name. Windows has the NVIDIA *driver* but
+# usually not the CUDA *runtime*, so without these Whisper falls back to CPU
+# (or fails with "cublas64_12.dll is not found"). JARVIS puts these DLL
+# directories on PATH before loading the model.
+stt-cuda = [
+    "faster-whisper>=1.2.1",
+    "nvidia-cublas-cu12>=12.9.2.10",
+    "nvidia-cudnn-cu12>=9.26.0.51",
+    "nvidia-cufft-cu12>=11.4.1.4",
+    "nvidia-curand-cu12>=10.3.10.19",
+    "nvidia-cusparse-cu12>=12.5.10.65",
+    "nvidia-cusolver-cu12>=11.7.5.82",
+    "nvidia-cuda-runtime-cu12>=12.9.79",
+    "onnxruntime>=1.30.0",
+    "numpy>=2.5.3",
+]
+tts = ["kokoro-onnx>=0.6.1", "espeakng-loader>=0.2.4", "soundfile>=0.14.0"]
+audio = ["sounddevice>=0.5.6", "silero-vad>=6.2.3", "numpy>=2.5.3"]
+wake = ["openwakeword>=0.6.0", "onnxruntime>=1.30.0", "numpy>=2.5.3"]
+
+# PEP 735 group: installed by every plain `uv sync`, unlike extras which get
+# de-selected whenever you sync with a different --extra set.
+[dependency-groups]
+dev = ["ruff>=0.16.9", "pytest>=9.1.1"]
+test = ["pytest>=9.1.1"]
+
+[project.scripts]
+jarvis = "jarvis.main:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+# Resolve for Windows only. Without this, openwakeword's linux-only
+# `tflite-runtime` dependency (no cp312 wheels) makes the whole graph
+# unsatisfiable even though that branch never installs here.
+environments = ["sys_platform == 'win32'"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["jarvis"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

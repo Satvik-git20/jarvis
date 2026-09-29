@@ -1,0 +1,19 @@
+# Secrets - never commit
+.env
+
+# Runtime data: conversation state, budget ledger, memory vectors, images
+.jarvis/
+
+# Probe / scratch artifacts
+*.log
+.serve*.log
+.jarvis-plugin-loaded.log
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+node_modules/

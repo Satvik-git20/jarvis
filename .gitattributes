@@ -1,0 +1,20 @@
+# Normalise line endings so editing on Windows does not rewrite every file.
+# Store LF in the repository, check out with native endings.
+* text=auto
+
+*.py   text diff=python
+*.ts   text
+*.mjs  text
+*.json text
+*.toml text
+*.md   text
+
+# Binary assets
+*.onnx binary
+*.bin  binary
+*.wav  binary
+*.jpg  binary
+*.png  binary
+
+# Keep generated/ignored things out of language stats and diffs
+uv.lock  -diff
