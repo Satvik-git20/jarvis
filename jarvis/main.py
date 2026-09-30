@@ -56,7 +56,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         from scripts.doctor import main as doctor_main
 
-        return asyncio.run(doctor_main())
+        # Pass an empty argv: `doctor` itself is not one of the doctor's own
+        # options, and re-parsing sys.argv would reject it.
+        return asyncio.run(doctor_main([]))
 
     if args.command == "daemon":
         from .daemon import serve

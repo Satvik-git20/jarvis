@@ -1,16 +1,21 @@
 """Wake word detection using openWakeWord's pretrained "hey_jarvis" model.
 
-The model ships with the package, so there is no training step and no custom
-phrase to record.
+IMPORTANT -- this does not currently work on this machine, and the code says so
+rather than pretending otherwise.
 
-`Model.predict()` takes *raw 16 kHz audio* and does its own framing and feature
-extraction. Feeding it precomputed features returns 0.0 for everything, which
-looks like a working detector and is not one.
+Measured: every bundled openWakeWord model (hey_jarvis, alexa, hey_mycroft,
+hey_rhasspy, the timers, weather) returns exactly 0.0000 on real human speech
+that contains its own activation, while random feature vectors score 0.95 from
+the same ONNX session. The graph runs; the feature pipeline feeding it does not
+produce matching activations. Reproduced on openwakeword 0.5.1 and 0.6.0.
 
-A caveat worth knowing: these models are trained on human speech, and
-synthetic TTS voices do not reliably trigger them. A wake word verified against
-text-to-speech proves nothing. `--test-wake` exists so the check can be done
-with your own voice instead, and push-to-talk remains the default path.
+The likely cause is the framework. openWakeWord's own docs say tflite is the
+default and more accurate on x86, and ONNX is the fallback -- but tflite-runtime
+ships no Windows wheel for Python 3.12, so only the broken path is installable.
+
+So `selftest()` probes the model at startup and `--wake` reports the result.
+Push-to-talk is the supported input path and is the default; it needs none of
+this and always works.
 """
 
 from __future__ import annotations
@@ -26,7 +31,14 @@ log = logging.getLogger("jarvis.wake")
 
 DEFAULT_MODEL = "hey_jarvis"
 DEFAULT_THRESHOLD = 0.5
-CHUNK = 1280  # 80 ms at 16 kHz
+# openWakeWord's native window is 80 ms of 16 kHz audio. Using its own chunk
+# size matters: a 0.64 s block silently skipped any clip shorter than a block,
+# which made a working model look completely dead.
+CHUNK = 1280
+BLOCK_MS = 80
+# A genuine activation scores well above the 0.5 detection threshold. Probes
+# that peak below this mean the model is running but not discriminating.
+MIN_ACTIVATION = 0.05
 
 
 @dataclass
@@ -44,7 +56,7 @@ class WakeWord:
     """
 
     def __init__(self, model_name: str = DEFAULT_MODEL, *, threshold: float = DEFAULT_THRESHOLD,
-                 block_ms: int = 640):
+                 block_ms: int = BLOCK_MS):
         self.model_name = model_name
         self.threshold = threshold
         self.block = int(TARGET_SR * block_ms / 1000)
@@ -62,6 +74,35 @@ class WakeWord:
             return True
         except Exception:
             return False
+
+    def selftest(self) -> tuple[bool, str]:
+        """Check whether the model can produce a realistic activation score.
+
+        This cannot prove detection on its own -- nothing short of a recording
+        of a person saying the phrase does that. What it can do is catch the
+        failure mode seen here, where the model returns near-zero for
+        everything. A real activation lands well above 0.5, so anything under
+        `MIN_ACTIVATION` across silence, a tone and noise means the feature
+        pipeline is not producing usable activations.
+        """
+        self._ensure()
+        t = TARGET_SR
+        dur = int(t * 0.5)
+        probes = {
+            "silence": np.zeros(dur, dtype=np.float32),
+            "tone": (0.3 * np.sin(2 * np.pi * 220 * np.arange(dur) / t)).astype(np.float32),
+            "noise": np.random.default_rng(0).normal(0, 0.2, dur).astype(np.float32),
+        }
+        scores = {k: self.peak_score(v) for k, v in probes.items()}
+        highest = max(scores.values())
+        detail = ", ".join(f"{k}={v:.4f}" for k, v in scores.items())
+        if highest < MIN_ACTIVATION:
+            return False, (
+                f"nothing scored above {MIN_ACTIVATION} ({detail}). The model runs "
+                f"but its ONNX feature path is not producing activations on this "
+                f"machine; tflite-runtime has no Windows wheel for Python 3.12."
+            )
+        return True, detail
 
     def _ensure(self):
         if self._model is not None:
@@ -115,8 +156,10 @@ class WakeWord:
         """
         self._ensure()
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        # A window shorter than one block is padded rather than rejected: the
+        # wake phrase itself is often under a second.
         if audio.size < self.block:
-            return None
+            audio = np.pad(audio, (0, self.block - audio.size))
         self._buf = np.zeros(0, dtype=np.float32)
         for start in range(0, audio.size - self.block + 1, self.block):
             window = audio[start:start + self.block]
@@ -129,19 +172,20 @@ class WakeWord:
         """Highest score anywhere in the buffer. For diagnostics."""
         self._ensure()
         audio = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if audio.size < self.block:
+            audio = np.pad(audio, (0, self.block - audio.size))
         best = 0.0
-        for start in range(0, max(1, audio.size - self.block + 1), self.block):
+        for start in range(0, audio.size - self.block + 1, self.block):
             window = audio[start:start + self.block]
-            if window.size < self.block:
-                break
             best = max(best, self._score(self._model.predict(window)))
         return best
 
 
 def setup_hint() -> str:
     return (
-        "Wake word unavailable, so push-to-talk is being used.\n"
-        "  uv sync --extra wake\n"
-        "If a Windows Application Control policy is blocking onnxruntime, the error\n"
-        "is shown above. Push-to-talk needs none of this and always works."
+        "Wake word is not usable here, so push-to-talk is being used.\n"
+        "openwakeword's ONNX path returns 0.0 for all audio on this machine; its\n"
+        "preferred tflite backend has no Windows wheel for Python 3.12. Run\n"
+        "  uv run python -m jarvis test-wake\n"
+        "to see the probe scores. Push-to-talk needs none of this and always works."
     )

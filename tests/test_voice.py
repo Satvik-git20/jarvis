@@ -205,6 +205,122 @@ def test_settings_carry_voice_defaults(tmp_path):
     assert s.whisper_model
 
 
+# --- endpointing state machine (no microphone needed) -----------------------
+
+
+def frames_of(n: int, level: float) -> list[np.ndarray]:
+    """n frames of constant amplitude, as the capture loop would deliver."""
+    return [np.full(FRAME_SAMPLES, level, dtype=np.float32) for _ in range(n)]
+
+
+def recorder_with_stub(rec: Recorder, *, speech: bool) -> Recorder:
+    """A Recorder whose gate always agrees with `speech`, bypassing the VAD."""
+    rec._is_speech = lambda frame: speech
+    return rec
+
+
+def test_speech_then_silence_yields_one_utterance():
+    r = recorder_with_stub(Recorder(), speech=False)
+    stream = iter(frames_of(40, 0.3) + frames_of(200, 0.0))
+    r._is_speech = lambda f: np.sqrt(np.mean(np.square(f))) > 0.1
+    got = list(r.endpoint(stream, timeout=5))
+    assert len(got) == 1
+    assert got[0].reason == "silence"
+    # 40 speech frames (1.28 s) plus the trailing silence.
+    assert 1.0 < got[0].duration < 6.0
+
+
+def test_long_idle_then_speech_does_not_hit_the_duration_cap():
+    """Regression: the cap counted frames since the stream opened, so after a
+    long idle it fired the instant the user began speaking.
+
+    3000 idle frames is 96 seconds, far past the 62-frame cap. A short
+    utterance after that must still end on silence.
+    """
+    r = Recorder(max_utterance_s=2.0)  # cap is only 62 frames
+    stream = iter(frames_of(3000, 0.0) + frames_of(30, 0.3) + frames_of(200, 0.0))
+    r._is_speech = lambda f: np.sqrt(np.mean(np.square(f))) > 0.1
+    got = list(r.endpoint(stream, timeout=30))
+    assert len(got) == 1
+    assert got[0].reason == "silence", "cap must count from speech, not from open"
+    assert got[0].duration < 2.0
+
+
+def test_speech_longer_than_the_cap_is_truncated_not_dropped():
+    r = Recorder(max_utterance_s=1.0)  # 31 frames
+    stream = iter(frames_of(500, 0.3))
+    r._is_speech = lambda f: np.sqrt(np.mean(np.square(f))) > 0.1
+    got = list(r.endpoint(stream, timeout=30))
+    assert len(got) == 1
+    assert got[0].reason == "max_duration"
+    assert got[0].duration <= 1.5
+
+
+def test_timeout_while_speaking_still_yields_the_audio():
+    """Regression: the timeout path broke out of the loop and discarded the
+    buffered speech, so a slow speaker lost their question entirely."""
+    r = Recorder()
+    stream = iter(frames_of(200, 0.3))
+    r._is_speech = lambda f: np.sqrt(np.mean(np.square(f))) > 0.1
+    got = list(r.endpoint(stream, timeout=0.0))  # already expired
+    assert len(got) == 1
+    assert got[0].reason == "timeout"
+    assert got[0].audio.size > 0
+
+
+def test_timeout_with_no_speech_yields_nothing():
+    r = Recorder()
+    r._is_speech = lambda f: False
+    got = list(r.endpoint(iter(frames_of(50, 0.0)), timeout=0.0))
+    assert got == []
+
+
+def test_speech_too_short_is_not_reported():
+    """A click or a cough must not become a question."""
+    r = Recorder()
+    stream = iter(frames_of(3, 0.3) + frames_of(200, 0.0))
+    r._is_speech = lambda f: np.sqrt(np.mean(np.square(f))) > 0.1
+    got = list(r.endpoint(stream, timeout=5))
+    assert got == []
+
+
+# --- adaptive noise tracking ------------------------------------------------
+
+
+def test_noise_floor_adapts_up_to_a_higher_room():
+    r = Recorder(rms_floor=0.004, noise_multiplier=3.0)
+    loud_quiet_frame = np.full(FRAME_SAMPLES, 0.05, dtype=np.float32)
+    for _ in range(400):
+        r._update_noise(0.05)  # a sustained hum, all below the multiplier
+    assert r.noise_floor > 0.03
+    # 0.05 background now, so 0.02 must read as silence.
+    assert r._is_speech(loud_quiet_frame) is False
+
+
+def test_noise_floor_recovers_after_noise_stops():
+    r = Recorder(rms_floor=0.004)
+    for _ in range(400):
+        r._update_noise(0.05)
+    for _ in range(400):
+        r._update_noise(0.001)
+    assert r.noise_floor < 0.01, "the gate must not stay shut after a fan stops"
+
+
+def test_quiet_speech_is_not_rejected_in_a_quiet_room():
+    """The measured room floor is ~0.002; ordinary speech at 0.03 must pass."""
+    r = Recorder(rms_floor=0.004, noise_multiplier=3.0)
+    r._update_noise(0.002)
+    frame = np.full(FRAME_SAMPLES, 0.03, dtype=np.float32)
+    r._vad = lambda: (lambda *a, **k: 0.95)
+    assert r._is_speech(frame) is True
+
+
+def test_dead_silent_input_is_never_speech():
+    r = Recorder(rms_floor=0.004)
+    r._vad = lambda: (lambda *a, **k: 0.99)  # even a confident VAD
+    assert r._is_speech(np.zeros(FRAME_SAMPLES, dtype=np.float32)) is False
+
+
 def test_recorder_finalise_handles_empty_input():
     u = Recorder()._finalise([])
     assert u.audio.size == 0

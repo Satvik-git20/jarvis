@@ -49,6 +49,20 @@ copy anything: if `.env` has no `OPENROUTER_API_KEY`, JARVIS falls back to the
 credential opencode already stores in `~/.local/share/opencode/auth.json`.
 Your own `.env` always wins.
 
+`jarvis doctor` lists every key you are missing with the exact signup URL:
+
+```
+To switch these on  (all free, no card)
+  groq          GROQ_API_KEY      https://console.groq.com/keys
+  cerebras      CEREBRAS_API_KEY  https://cloud.cerebras.ai
+  gemini        GEMINI_API_KEY    https://aistudio.google.com/apikey
+  tavily        TAVILY_API_KEY    https://app.tavily.com
+  jina_embed    JINA_API_KEY      https://jina.ai/embeddings
+  pollinations  POLLINATIONS_KEY  https://enter.pollinations.ai
+```
+
+None are required. Adding them only widens the failover chain.
+
 ### Privacy
 
 Google's free tier states that prompt content is used to improve their
@@ -77,19 +91,42 @@ faster-whisper on the GPU transcribes -> the router picks a brain -> the answer
 is spoken. Measured on a GTX 1650: transcription ~650 ms for an 11 s utterance,
 and the whole loop is usable in real time.
 
-**If it never stops listening**, the room is loud enough that the VAD reads it
-as speech. Run `test_voice.py calibrate` and put the suggested value in `.env`
-as `JARVIS_RMS_FLOOR`. `--vad-threshold 0.6` is the other lever.
+**No calibration is needed.** The gate tracks the room's noise level at runtime
+and accepts speech at 3x that, so it works in a quiet office and next to a fan
+without tuning. A fixed threshold could not: measured here, the floor was 0.0000
+while someone talked it read 0.14, and a value tuned during the noisy moment
+would have rejected ordinary quiet speech outright.
 
-**About the wake word:** `hey_jarvis` is a real pretrained model, but it was
-trained on human speech, so text-to-speech will not trigger it. Verify it with
-your own voice:
+**About the wake word:** it does not work on Windows + Python 3.12, and the code
+says so rather than pretending otherwise. openWakeWord's ONNX path returns
+`0.0000` for every model on real human speech that contains its own activation,
+while random feature vectors score 0.95 from the same session — the graph runs,
+the feature pipeline feeding it does not. Reproduced on 0.5.1 and 0.6.0. Their
+docs say tflite is the preferred backend on x86, and `tflite-runtime` ships no
+Windows wheel for 3.12, so only the broken path installs.
+
+`jarvis test-wake` prints the probe scores. Push-to-talk is the default input
+method and needs none of this.
+
+## Autostart
 
 ```powershell
-uv run python -m jarvis test-wake
+powershell -ExecutionPolicy Bypass -File scripts/install_autostart.ps1
 ```
 
-Push-to-talk is the default because it always works.
+Registers a hidden scheduled task so the daemon is up at logon, plus Start Menu
+shortcuts for the voice loop and the daemon. Undo with the same script and
+`-Remove`.
+
+## Checking for leaked keys
+
+```powershell
+uv run python scripts/check_secrets.py
+```
+
+Reports which files hold a live credential, whether git tracks any of them, and
+whether `.env` is ignored — without printing a single secret value. Run it
+before pushing anywhere public.
 
 ## Running
 

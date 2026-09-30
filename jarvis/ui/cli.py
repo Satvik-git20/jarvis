@@ -189,6 +189,16 @@ class Jarvis:
             self.say(f"    {RED}wake word unavailable: {self.wake.import_error}{RESET}",
                      colour=RED)
             self.wake = None
+        elif self.cfg.wake and self.wake:
+            healthy, detail = self.wake.selftest()
+            if not healthy:
+                self.say(f"    {RED}wake word model is dead on this machine{RESET}")
+                self.say(f"      {DIM}{detail}{RESET}", colour=DIM)
+                self.say(f"      {DIM}falling back to push-to-talk{RESET}", colour=DIM)
+                self.cfg.wake = False
+                self.wake = None
+            else:
+                self.say(f"    {GREEN}wake word ready{RESET} {DIM}({detail}){RESET}")
 
         self.say(f"    {DIM}loading speech model (first run downloads ~500 MB){RESET}",
                  colour=DIM)

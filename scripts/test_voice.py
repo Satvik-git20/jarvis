@@ -209,15 +209,25 @@ async def check_brain() -> int:
 
 
 async def run_wake_check(threshold: float = 0.5) -> int:
-    """Record 3 seconds and report the peak wake-word score."""
+    """Probe whether the wake-word model works at all, then score live audio."""
     print(f"\n{CYAN}wake word{RESET}")
-    from jarvis.voice.wake import WakeWord
+    from jarvis.voice.wake import WakeWord, setup_hint
 
     w = WakeWord(threshold=threshold)
     if not w.available():
         print(f"  {RED}openwakeword unavailable: {w.import_error}{RESET}")
-        print(f"  {DIM}push-to-talk still works and needs none of this{RESET}")
+        print(f"  {DIM}{setup_hint()}{RESET}")
         return 1
+
+    healthy, detail = w.selftest()
+    print(f"  model probe: {detail}")
+    if not healthy:
+        print(f"  {RED}model produces no activations on this machine{RESET}")
+        print(f"    {DIM}{detail}{RESET}")
+        print(f"  {YELLOW}push-to-talk still works and is the default{RESET}")
+        return 1
+    print(f"  {GREEN}model produces activations{RESET}")
+
     print("  say \"hey jarvis\" within 4 seconds")
     audio = np.zeros(0, dtype=np.float32)
     for utt in Recorder().utterances(timeout=12.0):
@@ -234,8 +244,8 @@ async def run_wake_check(threshold: float = 0.5) -> int:
         print(f"  {GREEN}detected{RESET} at {hit.at:.1f}s, score {hit.score:.3f}")
         return 0
     print(f"  {YELLOW}not detected{RESET}")
-    print(f"    {DIM}if you definitely said it, try --threshold 0.35;"
-          f" these models are trained on human speech and vary by voice{RESET}")
+    print(f"    {DIM}if you definitely said it, try --threshold 0.35; "
+          f"these models vary a lot by voice{RESET}")
     return 1
 
 

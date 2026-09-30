@@ -100,7 +100,8 @@ class Recorder:
         device: int | str | None = None,
         *,
         threshold: float = 0.5,
-        rms_floor: float = 0.015,
+        rms_floor: float = 0.004,
+        noise_multiplier: float = 3.0,
         silence_ms: int = 700,
         min_speech_ms: int = 300,
         max_utterance_s: float = 30.0,
@@ -108,18 +109,28 @@ class Recorder:
     ):
         self.device = device
         self.threshold = threshold
-        # Silero on its own is not enough in a room with steady background
-        # sound: measured here, it flagged 62% of frames as speech with nobody
-        # talking, because a fan or hum is spectrally speech-like. The energy
-        # floor rejects that. Run `jarvis test-voice --calibrate` to set it
-        # for your room.
+        # A fixed energy floor cannot be right everywhere. Measured in this
+        # room: 0.0058 overall but 0.0000 across most 300 ms windows, so a
+        # "calibrated" value of 0.015 (taken while someone was talking) would
+        # reject ordinary quiet speech outright.
+        #
+        # So the floor is tracked instead of fixed. `rms_floor` is only a
+        # backstop for a dead-silent input, and speech must clear
+        # `noise_multiplier` times the running noise level on top of that.
         self.rms_floor = rms_floor
+        self.noise_multiplier = noise_multiplier
+        self._noise = rms_floor
         self.silence_frames = max(1, silence_ms // FRAME_MS)
         self.min_speech_frames = max(1, min_speech_ms // FRAME_MS)
         self.max_frames = int(max_utterance_s * 1000 / FRAME_MS)
         self.preroll_frames = max(1, pre_roll_ms // FRAME_MS)
         self._model = None
         self._interrupted = False
+
+    @property
+    def noise_floor(self) -> float:
+        """Current estimate of the room's background level."""
+        return self._noise
 
     # --- VAD -------------------------------------------------------------
 
@@ -143,84 +154,122 @@ class Recorder:
         """
         import torch
 
-        chunk = torch.from_numpy(np.ascontiguousarray(frame, dtype=np.float32))
-        if float(np.sqrt(np.mean(np.square(frame)))) < self.rms_floor:
-            # Too quiet to be speech. Cheaper than the model and immune to its
-            # false positives on steady noise.
+        rms = float(np.sqrt(np.mean(np.square(frame))))
+        gate = max(self.rms_floor, self._noise * self.noise_multiplier)
+        if rms < gate:
+            # Too quiet to be speech. Cheaper than running the model, and
+            # immune to its false positives on steady background sound.
+            self._update_noise(rms)
             return False
-        return float(self._vad()(chunk, TARGET_SR)) >= self.threshold
+
+        chunk = torch.from_numpy(np.ascontiguousarray(frame, dtype=np.float32))
+        prob = float(self._vad()(chunk, TARGET_SR))
+        if prob >= self.threshold:
+            return True
+        self._update_noise(rms)
+        return False
+
+    def _update_noise(self, rms: float) -> None:
+        """Track the background level from frames the VAD called silence.
+
+        An exponential average is enough: a slow rise absorbs a fan starting
+        up, and a fast fall means the floor recovers quickly once the noise
+        stops, so the next utterance is not gated by a stale estimate.
+        """
+        # Rise slowly, fall quickly.
+        alpha = 0.02 if rms > self._noise else 0.15
+        self._noise = (1 - alpha) * self._noise + alpha * rms
+        # Never fall below the absolute backstop.
+        self._noise = max(self._noise, self.rms_floor * 0.5)
+
+    def reset_noise(self) -> None:
+        self._noise = self.rms_floor
 
     # --- capture ---------------------------------------------------------
 
     def utterances(self, *, timeout: float | None = None) -> Iterator[Utterance]:
-        """Yield utterances until `timeout` seconds elapse with no speech.
+        """Capture from the microphone until one utterance completes.
 
-        The stream stays open between utterances so the user can speak again
-        without re-opening the device, which avoids a click and a slow restart.
+        Returns after the first completed utterance, or after `timeout`
+        seconds with nothing said. The stream is opened once per call rather
+        than held open between utterances: keeping it open means `read()` can
+        hand back buffered audio faster than it arrives, which made the
+        duration cap fire on wall-clock guesses rather than on real speech.
         """
         sd = _sd()
         self._vad()  # load before opening the stream, so init is not captured
+
+        def frames():
+            with sd.InputStream(
+                samplerate=TARGET_SR,
+                blocksize=FRAME_SAMPLES,
+                device=self.device,
+                channels=1,
+                dtype="float32",
+            ) as stream:
+                while True:
+                    block, _ = stream.read(FRAME_SAMPLES)
+                    yield np.asarray(block, dtype=np.float32).reshape(-1)
+
+        yield from self.endpoint(frames(), timeout=timeout)
+
+    def endpoint(
+        self, frames: Iterator[np.ndarray], *, timeout: float | None = None
+    ) -> Iterator[Utterance]:
+        """Turn a stream of 32 ms frames into utterances.
+
+        Split out from capture so the endpointing rules can be tested without
+        a microphone. Two bugs lived here and were invisible to unit tests:
+        the duration cap counted frames since the stream opened rather than
+        since speech began, and the timeout path discarded buffered speech
+        instead of yielding it.
+        """
         started = time.time()
-        last_activity = started
+        ring: list[np.ndarray] = []
+        collecting = False
+        speech_frames = 0
+        silent_frames = 0
+        # Frames since speech started, not since the stream opened.
+        collected_frames = 0
 
-        with sd.InputStream(
-            samplerate=TARGET_SR,
-            blocksize=FRAME_SAMPLES,
-            device=self.device,
-            channels=1,
-            dtype="float32",
-        ) as stream:
-            ring: list[np.ndarray] = []
-            collecting = False
-            speech_frames = 0
-            silent_frames = 0
-            total_frames = 0
+        for frame in frames:
+            if timeout is not None and time.time() - started > timeout:
+                if collecting and ring:
+                    yield self._finalise(ring, reason="timeout")
+                return
+            if self._interrupted:
+                self._interrupted = False
+                return
 
-            while True:
-                if timeout is not None and time.time() - last_activity > timeout:
-                    if collecting and ring:
-                        break
-                    if not collecting:
-                        return
-                if self._interrupted:
-                    self._interrupted = False
-                    return
+            speech = self._is_speech(frame)
 
-                block, _ = stream.read(FRAME_SAMPLES)
-                frame = np.asarray(block, dtype=np.float32).reshape(-1)
-                total_frames += 1
-                speech = self._is_speech(frame)
-
-                if not collecting:
-                    ring.append(frame)
-                    if len(ring) > self.preroll_frames:
-                        ring.pop(0)
-                    if speech:
-                        collecting = True
-                        speech_frames = 1
-                        silent_frames = 0
-                        last_activity = time.time()
-                    elif total_frames % 25 == 0:
-                        # Cheap poll so an idle recorder still honours timeout.
-                        last_activity = max(last_activity, time.time())
-                    continue
-
+            if not collecting:
                 ring.append(frame)
+                if len(ring) > self.preroll_frames:
+                    ring.pop(0)
                 if speech:
-                    speech_frames += 1
+                    collecting = True
+                    speech_frames = 1
                     silent_frames = 0
-                    last_activity = time.time()
-                else:
-                    silent_frames += 1
+                    collected_frames = 1
+                continue
 
-                if silent_frames >= self.silence_frames and speech_frames >= self.min_speech_frames:
-                    yield self._finalise(ring)
-                    return
-                if total_frames >= self.max_frames and collecting:
-                    yield self._finalise(ring, reason="max_duration")
-                    return
-                if total_frames >= self.max_frames * 40 and not collecting:
-                    return
+            ring.append(frame)
+            collected_frames += 1
+            if speech:
+                speech_frames += 1
+                silent_frames = 0
+            else:
+                silent_frames += 1
+
+            if silent_frames >= self.silence_frames and speech_frames >= self.min_speech_frames:
+                yield self._finalise(ring)
+                return
+            if collected_frames >= self.max_frames:
+                # Hard cap: a stuck-open gate or a very long answer must not
+                # buffer forever.
+                yield self._finalise(ring, reason="max_duration")
+                return
 
     def _finalise(self, frames: list[np.ndarray], *, reason: str = "silence") -> Utterance:
         audio = np.concatenate(frames) if frames else np.zeros(0, dtype=np.float32)

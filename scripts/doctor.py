@@ -23,7 +23,9 @@ import httpx
 
 from jarvis.config import REGISTRY, get_settings
 
-GREEN, RED, YELLOW, DIM, RESET = "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[0m"
+GREEN, RED, YELLOW, DIM, BOLD, RESET = (
+    "\033[32m", "\033[31m", "\033[33m", "\033[2m", "\033[1m", "\033[0m"
+)
 
 WIKIPEDIA = (
     "https://en.wikipedia.org/w/api.php?action=query&list=search"
@@ -176,6 +178,26 @@ async def _authed_post(client: httpx.AsyncClient, url: str, s, cap_name: str):
 ICON = {"+": f"{GREEN}OK  {RESET}", "!": f"{YELLOW}WARN{RESET}", "x": f"{RED}FAIL{RESET}",
         "-": f"{DIM}SKIP{RESET}", "?": f"{DIM}INFO{RESET}"}
 
+# Where to get each missing key. All of these free tiers need no credit card.
+SIGNUP = {
+    "groq":        "https://console.groq.com/keys",
+    "cerebras":    "https://cloud.cerebras.ai",
+    "gemini":      "https://aistudio.google.com/apikey",
+    "tavily":      "https://app.tavily.com",
+    "pollinations": "https://enter.pollinations.ai",
+    "jina_embed":  "https://jina.ai/embeddings",
+    "jina_reader": "https://jina.ai/reader (optional, raises 20->500 rpm)",
+    "openrouter":  "https://openrouter.ai/keys (optional: the opencode fallback already supplies this)",
+}
+
+ENV_NAME = {
+    "groq": "GROQ_API_KEY", "cerebras": "CEREBRAS_API_KEY", "gemini": "GEMINI_API_KEY",
+    "tavily": "TAVILY_API_KEY", "pollinations": "POLLINATIONS_KEY", "jina_embed": "JINA_API_KEY",
+    "jina_reader": "JINA_API_KEY", "openrouter": "OPENROUTER_API_KEY",
+    # Shares the Groq key, so it dedupes against the `groq` row above.
+    "groq_stt": "GROQ_API_KEY",
+}
+
 KIND_LABEL = {
     "llm": "Brains (LLM)", "stt": "Voice in", "tts": "Voice out",
     "search": "Search", "embed": "Embeddings", "image": "Image",
@@ -183,10 +205,14 @@ KIND_LABEL = {
 }
 
 
-async def main() -> int:
-    ap = argparse.ArgumentParser()
+async def main(argv: list[str] | None = None) -> int:
+    """Accept argv so `python -m jarvis doctor` can pass an explicit empty list.
+
+    Re-parsing sys.argv would see the word `doctor` as an unknown argument.
+    """
+    ap = argparse.ArgumentParser(prog="jarvis doctor")
     ap.add_argument("--key-only", action="store_true", help="skip network probes")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     s = get_settings()
     s.ensure_data_dir()
@@ -210,9 +236,32 @@ async def main() -> int:
             last_kind = kind
         print(f"  {ICON.get(status, '?')}  {label:<32} {DIM}{detail}{RESET}")
 
+    # Dedupe by env var: several capabilities share one key (groq_stt reuses
+    # GROQ_API_KEY), and listing the same signup twice is just noise.
+    seen_env: set[str] = set()
+    missing = []
+    for cap in REGISTRY:
+        if not cap.requires_key or s.available(cap):
+            continue
+        marker = ENV_NAME.get(cap.name) or cap.name
+        if marker in seen_env:
+            continue
+        seen_env.add(marker)
+        missing.append(cap)
+
     ok = sum(1 for r in results if r[0] == "+")
     fail = sum(1 for r in results if r[0] == "x")
     warn = sum(1 for r in results if r[0] == "!")
+
+    if missing:
+        print(f"\n{BOLD}To switch these on{RESET}  {DIM}(all free, no card){RESET}")
+        for cap in missing:
+            env = ENV_NAME.get(cap.name, "")
+            url = SIGNUP.get(cap.name, "")
+            print(f"  {YELLOW}{cap.name:<14}{RESET} {DIM}{env:<18}{RESET} {url}")
+        print(f"\n  {DIM}add the value to .env, then re-run the doctor. Nothing here is")
+        print(f"  required: keyless services already work.{RESET}")
+
     print(f"\n  {GREEN}{ok} ok{RESET}  {YELLOW}{warn} warn{RESET}  {RED}{fail} unavailable\n")
     return 0
 

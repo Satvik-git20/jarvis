@@ -114,9 +114,9 @@ class Settings:
     daemon_port: int
     daemon_token: str
     exclude_privacy_unsafe: bool
-    # Defaults suit a fairly quiet room. `jarvis test-voice --calibrate`
-    # measures a noisy one and prints values to put in .env.
-    rms_floor: float = 0.015
+    # Backstop only. The Recorder tracks the real noise level at runtime and
+    # gates on noise_multiplier x that, so these are not a calibration.
+    rms_floor: float = 0.004
     vad_threshold: float = 0.5
     whisper_model: str = "small"
     _opencode_auth: dict[str, Any] | None = field(default=None, repr=False)
