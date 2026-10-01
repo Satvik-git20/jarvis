@@ -69,6 +69,53 @@ Google's free tier states that prompt content is used to improve their
 products. Set `JARVIS_EXCLUDE_PRIVACY_UNSAFE=1` to remove Gemini from the
 chain entirely.
 
+### Durable storage
+
+JARVIS stores conversations, message history, provider usage, cooldowns, and
+future conversation summaries in `.jarvis/jarvis.db`. SQLite runs in WAL mode
+with transactional migrations. The daemon is the only process that writes this
+file: the voice loop, `jarvis talk`, and the Chrome panel are HTTP clients of
+the daemon, so there is exactly one writer per database.
+
+Existing installations are backward compatible: on first startup JARVIS
+imports `.jarvis/sessions.json` and `.jarvis/budget.json` into SQLite exactly
+once. The legacy files are left untouched as a recovery copy; after import,
+all new conversation and budget writes go only to `jarvis.db`.
+
+The schema currently contains `conversations`, `messages`, `summaries`, and
+`provider_logs`. Migration versions are recorded in the database and every
+migration is applied atomically. Back up `.jarvis/jarvis.db` before moving the
+data directory or performing a manual downgrade.
+
+**Migration path.** `v0` (racy `sessions.json` + `budget.json`) becomes `v1`
+(`jarvis.db`) on first open: the legacy files are imported inside one
+transaction, guarded by the `legacy_imports` table so it happens exactly once,
+and are then left untouched as a recovery copy. Every later schema change is a
+new `Migration(n, ...)` applied atomically and recorded in `schema_migrations`;
+a failed migration rolls back its partial schema and does not record a version,
+so retrying is always safe.
+
+**Rollback.** Stop JARVIS, delete `.jarvis/jarvis.db`, and start again: the
+untouched legacy JSON re-imports and you are back at `v0`. To keep current data
+while downgrading the code, copy `jarvis.db` aside first — old code cannot read
+it, but nothing is lost when you upgrade again.
+
+**Concurrency.** The daemon is the sole writer of `jarvis.db`; it opens the
+database with WAL plus `BEGIN IMMEDIATE` transactions and a 10s busy timeout,
+so the rare second writer (a migration run, `jarvis doctor`, a second daemon
+starting up) queues instead of failing. Every other entry point — voice CLI,
+`jarvis talk`, the Chrome panel, opencode — goes through the daemon's HTTP API
+(`/ask`, `/status`, `/session/...`), and none of them opens the database. The
+daemon must be running for `jarvis run` and `jarvis talk` to get an answer;
+if it is down they say so instead of writing a second copy of the state.
+
+On Windows the daemon runs uvicorn on the *selector* event loop rather than
+the default proactor loop: the proactor accept path permanently stops
+accepting after a single failed `AcceptEx` (a client that dies in the accept
+queue), leaving the daemon reachable-looking but unresponsive. The selector
+loop keeps its read handler armed and heals instead — see
+`uvicorn_loop_setting()` in `jarvis/daemon.py`.
+
 ## Voice
 
 ```powershell
@@ -79,6 +126,8 @@ uv run python -m jarvis run                    # start the loop
 
 Press **Enter** to talk. Type a question instead at any time, and
 `/quit`, `/status`, `/devices`, `/nospeak` work as commands.
+The loop answers through the daemon, so start it first in another terminal —
+the voice session, the Chrome panel, and opencode then share one context.
 
 ```powershell
 uv run python -m jarvis run --wake             # also listen for "hey jarvis"
@@ -107,6 +156,25 @@ Windows wheel for 3.12, so only the broken path installs.
 
 `jarvis test-wake` prints the probe scores. Push-to-talk is the default input
 method and needs none of this.
+
+## Chrome side panel
+
+Chat with JARVIS from a Chrome side panel — the same daemon, sessions, and
+budget as the voice loop and opencode.
+
+```powershell
+uv run python -m jarvis daemon            # must be running
+```
+
+Then `chrome://extensions` → **Developer mode** → **Load unpacked** → select
+`chrome-extension/`. Click the JARVIS toolbar icon, open **Settings**, and paste
+`JARVIS_DAEMON_TOKEN` from `.env`.
+
+The extension only ever talks to `127.0.0.1:8765`. The daemon answers CORS for
+`chrome-extension://` origins only: a web page can reach the loopback port but
+cannot read a response, and every route still requires the token regardless.
+The token is stored in that browser profile's local storage and never synced.
+See `chrome-extension/README.md` for details.
 
 ## Autostart
 
@@ -141,6 +209,9 @@ The daemon binds to loopback only and requires the `JARVIS_DAEMON_TOKEN`
 header, because any web page your browser loads can reach `127.0.0.1`. It is an
 API, not a website: `/` returns 404, `/health` returns JSON, and `/docs` is a
 Swagger page.
+
+Start the daemon first: `jarvis run` and `jarvis talk` are HTTP clients of it,
+and will print a startup hint (or a clear error) when it is not running.
 
 ## opencode integration
 

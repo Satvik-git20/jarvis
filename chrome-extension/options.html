@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JARVIS settings</title>
+  <link rel="stylesheet" href="sidepanel.css">
+  <style>
+    .form { padding: 18px 16px; display: flex; flex-direction: column; gap: 14px; max-width: 460px; }
+    label { display: flex; flex-direction: column; gap: 5px; font-weight: 600; }
+    label span { color: var(--dim); font-weight: 400; font-size: 12px; }
+    input {
+      background: var(--bg); color: var(--text);
+      border: 1px solid var(--border); border-radius: 8px;
+      padding: 8px 9px; font: inherit;
+    }
+    input:focus { outline: none; border-color: var(--accent); }
+    .row { display: flex; gap: 8px; align-items: center; }
+    #result { font-size: 12px; color: var(--dim); }
+    #result.ok { color: #3ddc84; }
+    #result.bad { color: var(--error); }
+  </style>
+</head>
+<body>
+  <div class="form">
+    <h2 style="margin:0">JARVIS settings</h2>
+
+    <label>
+      Daemon URL
+      <span>The loopback address of <code>uv run python -m jarvis daemon</code>.</span>
+      <input id="url" type="url" spellcheck="false">
+    </label>
+
+    <label>
+      Daemon token
+      <span>The value of <code>JARVIS_DAEMON_TOKEN</code> in <code>.env</code>. Stored locally in this browser profile only.</span>
+      <input id="token" type="password" spellcheck="false" autocomplete="off">
+    </label>
+
+    <div class="row">
+      <button id="save" type="button">Save</button>
+      <button id="test" type="button">Test connection</button>
+      <span id="result"></span>
+    </div>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>

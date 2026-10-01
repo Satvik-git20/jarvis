@@ -7,7 +7,8 @@ Three ways in, one way out:
     type a question  always available, useful when the room is noisy
 
 All three share the same session and the same provider budget as the opencode
-tools, because they all read the same daemon-equivalent state held in-process.
+tools, because they all talk to the same daemon over HTTP: the daemon is the
+only process that owns the router, the ledger, and jarvis.db.
 """
 
 from __future__ import annotations
@@ -17,13 +18,12 @@ import contextlib
 import logging
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 
+from ..client import DaemonClient, DaemonError, ProvidersExhausted
 from ..config import Settings, get_settings
-from ..core.budget import BudgetLedger
-from ..core.conversation import DEFAULT_SYSTEM, SessionStore
-from ..core.providers.base import Message
-from ..core.router import AllProvidersExhausted, Router
+from ..core.conversation import DEFAULT_SYSTEM
 from ..voice import tts as tts_mod
 from ..voice.audio import TARGET_SR, Recorder, list_inputs, list_outputs
 from ..voice.stt import Transcriber
@@ -60,9 +60,12 @@ class Jarvis:
         self.cfg = cfg
         self.settings = settings or get_settings()
         self.settings.ensure_data_dir()
-        data = self.settings.data_dir
-        self.router = Router(BudgetLedger(data / "budget.json"), self.settings)
-        self.sessions = SessionStore(data / "sessions.json")
+        # The daemon owns all conversational state; this loop is a client.
+        self.client = DaemonClient(self.settings)
+        # One session per loop run, reused every turn so the daemon can build
+        # real context. Previously a None session id minted a fresh session
+        # per turn and the loop never saw its own history.
+        self.session_id = cfg.session_id or f"s_cli_{uuid.uuid4().hex[:12]}"
         self.stt = Transcriber(self.settings, model=cfg.whisper_model,
                                prefer_gpu=cfg.prefer_gpu)
         self.speaker = tts_mod.Speaker(self.settings, voice=cfg.tts_voice,
@@ -85,26 +88,32 @@ class Jarvis:
         if not self.cfg.quiet:
             print(f"{colour}{text}{RESET}", flush=True)
 
-    def status_line(self) -> str:
-        ready = self.router.ready()
+    async def status_line(self) -> str:
+        try:
+            status = await self.client.status()
+            ready = ",".join(status.get("ready_providers", [])) or "none"
+        except DaemonError:
+            ready = "daemon down"
         dev = "gpu" if self.stt.prefer_gpu else "cpu"
-        return (f"{DIM}providers: {','.join(ready) or 'none'} · "
+        return (f"{DIM}providers: {ready} · "
                 f"stt: whisper-{self.cfg.whisper_model}/{dev} · "
                 f"tts: {'kokoro' if self.cfg.tts_local else 'edge'}"
                 f"{RESET}")
 
     async def ask(self, prompt: str) -> str:
-        sid = self.sessions.get_or_create(self.cfg.session_id)
-        msgs = self.sessions.history(sid, system=DEFAULT_SYSTEM)
-        msgs.append(Message("user", prompt))
         try:
-            result = await self.router.complete(
-                msgs, prefer="ollama" if self.cfg.local_brain else None, timeout=300.0
+            result = await self.client.ask(
+                prompt,
+                session_id=self.session_id,
+                system=DEFAULT_SYSTEM,
+                prefer="ollama" if self.cfg.local_brain else None,
+                timeout=300.0,
             )
-        except AllProvidersExhausted as exc:
+        except ProvidersExhausted as exc:
             detail = "; ".join(f"{n}: {w}" for n, w in exc.attempts)
             return f"I could not reach any AI provider. {detail}"
-        self.sessions.append(sid, prompt, result.text)
+        except DaemonError as exc:
+            return str(exc)
         self.say(f"    {DIM}[{result.provider}/{result.model} {result.latency_ms}ms]{RESET}",
                  colour=DIM)
         return result.text
@@ -179,7 +188,12 @@ class Jarvis:
     async def run(self) -> int:
         self.say(f"{BOLD}JARVIS{RESET} {DIM}v0.1.0 · /quit to exit · "
                  f"Enter=push-to-talk{', say the wake word' if self.cfg.wake else ''}{RESET}")
-        self.say(self.status_line(), colour=DIM)
+        try:
+            await self.client.health()
+        except DaemonError:
+            self.say(f"    {RED}daemon not running — start it with: "
+                     f"uv run python -m jarvis daemon{RESET}", colour=RED)
+        self.say(await self.status_line(), colour=DIM)
         if self.cfg.speak:
             hint = self.speaker.kokoro_setup_hint()
             if hint and not self.cfg.tts_local:
@@ -234,7 +248,7 @@ class Jarvis:
                 if line in ("/quit", "/exit", "/q"):
                     break
                 if line == "/status":
-                    self.say(self.status_line(), colour=DIM)
+                    self.say(await self.status_line(), colour=DIM)
                     continue
                 if line == "/devices":
                     self._show_devices()
@@ -261,6 +275,7 @@ class Jarvis:
                 break
             except EOFError:
                 break
+        await self.client.close()
         return 0
 
     def _show_devices(self) -> None:

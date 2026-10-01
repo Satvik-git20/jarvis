@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "JARVIS",
+  "version": "0.1.0",
+  "description": "Chat with the local JARVIS daemon from Chrome's side panel.",
+  "minimum_chrome_version": "114",
+  "permissions": ["sidePanel", "storage"],
+  "host_permissions": ["http://127.0.0.1:8765/*"],
+  "side_panel": { "default_path": "sidepanel.html" },
+  "background": { "service_worker": "background.js" },
+  "action": { "default_title": "Open JARVIS side panel" },
+  "options_page": "options.html"
+}

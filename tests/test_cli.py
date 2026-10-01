@@ -89,3 +89,93 @@ def test_bad_device_index_becomes_none_not_a_crash():
     _, kwargs = parse(["run", "--mic", "not-a-number"])
     assert kwargs["input_device"] is None
     Config(**kwargs)  # must not raise
+
+
+# --- `python -m jarvis talk` is a daemon client, not a second writer --------
+
+
+def _patch_talk_client(monkeypatch, impl):
+    import jarvis.client as client_mod
+
+    monkeypatch.setattr(client_mod, "DaemonClient", impl)
+    return client_mod
+
+
+def test_talk_goes_through_the_daemon_and_skips_persistence(monkeypatch, capsys):
+    """One-shot questions must use the daemon (sole writer) and remember=False
+    (no empty session row per command)."""
+    import asyncio
+
+    import jarvis.main as main_mod
+    from jarvis.client import Answer
+
+    calls: dict = {}
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ask(self, prompt, **kwargs):
+            calls["prompt"] = prompt
+            calls["kwargs"] = kwargs
+            return Answer(text="4", provider="ollama", model="m",
+                          tokens=1, latency_ms=2, session_id="")
+
+        async def close(self):
+            calls["closed"] = True
+
+    _patch_talk_client(monkeypatch, FakeClient)
+    rc = asyncio.run(main_mod._talk("2+2", True))
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "4" in out
+    assert "[ollama/m" in out
+    assert calls["prompt"] == "2+2"
+    assert calls["kwargs"]["remember"] is False
+    assert calls["kwargs"]["prefer"] == "ollama"
+    assert calls["closed"] is True
+
+
+def test_talk_reports_a_down_daemon_instead_of_crashing(monkeypatch, capsys):
+    import asyncio
+
+    import jarvis.main as main_mod
+    from jarvis.client import DaemonDown
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ask(self, prompt, **kwargs):
+            raise DaemonDown("connection refused")
+
+        async def close(self):
+            pass
+
+    _patch_talk_client(monkeypatch, FakeClient)
+    rc = asyncio.run(main_mod._talk("hi", False))
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "uv run python -m jarvis daemon" in err
+
+
+def test_talk_propagates_exhausted_providers_as_a_failure(monkeypatch, capsys):
+    import asyncio
+
+    import jarvis.main as main_mod
+    from jarvis.client import ProvidersExhausted
+
+    class FakeClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def ask(self, prompt, **kwargs):
+            raise ProvidersExhausted([("ollama", "429 cooldown")])
+
+        async def close(self):
+            pass
+
+    _patch_talk_client(monkeypatch, FakeClient)
+    rc = asyncio.run(main_mod._talk("hi", False))
+    assert rc == 1
+    assert "ollama: 429 cooldown" in capsys.readouterr().err

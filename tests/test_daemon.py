@@ -80,6 +80,30 @@ def client(tmp_path, monkeypatch):
         yield c
 
 
+# --- event loop (Windows accept-wedge regression) ---------------------------
+
+
+def test_daemon_opts_out_of_the_proactor_accept_loop():
+    """Windows' default proactor loop stops accepting forever after one
+    failed AcceptEx (a client reset in the accept queue): the loop idles in
+    GetQueuedCompletionStatus while new connections pile up in the backlog.
+    uvicorn hard-codes the proactor on Windows, so the daemon must inject the
+    self-healing selector loop as a custom loop factory."""
+    import sys
+
+    from jarvis.daemon import _selector_loop, uvicorn_loop_setting
+
+    if sys.platform == "win32":
+        assert uvicorn_loop_setting() == "jarvis.daemon:_selector_loop"
+        loop = _selector_loop()
+        try:
+            assert isinstance(loop, asyncio.SelectorEventLoop)
+        finally:
+            loop.close()
+    else:
+        assert uvicorn_loop_setting() == "asyncio"
+
+
 # --- auth -------------------------------------------------------------------
 
 
@@ -107,6 +131,53 @@ def test_status_accepts_correct_token(client):
 def test_ask_requires_token(client):
     r = client.post("/ask", json={"prompt": "hello"})
     assert r.status_code == 401
+
+
+def test_ask_without_remember_leaves_no_session_row(client):
+    """remember=false must not create an empty conversation.
+
+    The handler used to call get_or_create before the model answered, so
+    every one-shot question left a dead zero-message session behind."""
+    client.stub_state.router = FakeProvider("ollama")
+    auth = {"X-Jarvis-Token": TOKEN}
+    r = client.post("/ask", json={"prompt": "one-shot", "remember": False},
+                    headers=auth)
+    assert r.status_code == 200, r.text
+    sid = r.json()["session_id"]
+    assert sid.startswith("s_")
+    assert sid not in client.stub_state.sessions.ids()
+    assert client.get(f"/session/{sid}", headers=auth).status_code == 404
+
+
+def test_ask_remembers_the_turn_and_history_contains_both_sides(client):
+    client.stub_state.router = FakeProvider("ollama")
+    auth = {"X-Jarvis-Token": TOKEN}
+    r = client.post("/ask", json={"prompt": "hi", "session_id": "s_t",
+                                  "remember": True}, headers=auth)
+    assert r.status_code == 200, r.text
+    history = client.get("/session/s_t", headers=auth).json()
+    contents = [m["content"] for m in history["messages"]]
+    assert "hi" in contents
+    assert "answered by ollama" in contents
+
+
+def test_ask_passes_the_client_timeout_through_to_the_router(client):
+    """The CLI needs a 300s budget for cold local models; the router default
+    is 60s, so /ask has to forward the caller's value."""
+    fake = FakeProvider("ollama")
+    client.stub_state.router = fake
+    seen: dict = {}
+    original = fake.complete
+
+    async def spy(messages, **kw):
+        seen.update(kw)
+        return await original(messages, **kw)
+
+    fake.complete = spy
+    r = client.post("/ask", json={"prompt": "x", "timeout": 123},
+                    headers={"X-Jarvis-Token": TOKEN})
+    assert r.status_code == 200, r.text
+    assert seen["timeout"] == 123
 
 
 def test_daemon_refuses_to_serve_without_a_configured_token(tmp_path, monkeypatch):
@@ -387,3 +458,40 @@ def test_ledger_penalty_clears_on_success(tmp_path):
     assert ledger.available("t") is False
     ledger.record("t")
     assert ledger.available("t") is True
+
+
+# --- CORS: the Chrome side panel is the only cross-origin reader ------------
+
+EXTENSION_ORIGIN = f"chrome-extension://{('a' * 32)}"
+
+
+def test_extension_preflight_is_accepted(client):
+    r = client.options("/ask", headers={
+        "Origin": EXTENSION_ORIGIN,
+        "Access-Control-Request-Method": "POST",
+        "Access-Control-Request-Headers": "x-jarvis-token,content-type",
+    })
+    assert r.status_code in (200, 204)
+    assert r.headers["access-control-allow-origin"] == EXTENSION_ORIGIN
+    assert "x-jarvis-token" in r.headers["access-control-allow-headers"].lower()
+    assert "POST" in r.headers["access-control-allow-methods"]
+
+
+def test_extension_reads_responses_cross_origin(client):
+    r = client.get("/health", headers={"Origin": EXTENSION_ORIGIN})
+    assert r.status_code == 200
+    assert r.headers["access-control-allow-origin"] == EXTENSION_ORIGIN
+
+
+def test_ordinary_web_pages_get_no_cors_headers(client):
+    """A web page may reach the port, but it must not be able to read replies."""
+    r = client.get("/health", headers={"Origin": "https://evil.example"})
+    assert r.status_code == 200
+    assert "access-control-allow-origin" not in r.headers
+
+
+def test_extension_still_needs_the_token(client):
+    """CORS is a readability grant, not an auth bypass."""
+    assert client.post("/ask", json={"prompt": "hi"},
+                       headers={"Origin": EXTENSION_ORIGIN}).status_code == 401
+    assert client.get("/session/x", headers={"Origin": EXTENSION_ORIGIN}).status_code == 401

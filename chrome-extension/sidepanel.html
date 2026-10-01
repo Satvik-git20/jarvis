@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JARVIS</title>
+  <link rel="stylesheet" href="sidepanel.css">
+</head>
+<body>
+  <header>
+    <div class="brand">
+      <span class="dot" id="dot" title="daemon status"></span>
+      <span class="name">JARVIS</span>
+      <span class="providers" id="providers"></span>
+    </div>
+    <div class="actions">
+      <button id="new" type="button" title="clear this conversation">New chat</button>
+      <button id="settings" type="button" title="settings">Settings</button>
+    </div>
+  </header>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <main id="messages"></main>
+
+  <footer>
+    <textarea id="input" rows="1" placeholder="Message JARVIS &#8629; Enter to send, Shift+Enter for a new line"></textarea>
+    <button id="send" type="button">Send</button>
+  </footer>
+
+  <script src="sidepanel.js"></script>
+</body>
+</html>

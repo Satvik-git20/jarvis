@@ -114,22 +114,22 @@ def _maybe_int(value: str | None) -> int | None:
 
 
 async def _talk(prompt: str, local_brain: bool) -> int:
-    from .config import get_settings
-    from .core.budget import BudgetLedger
-    from .core.providers.base import Message
-    from .core.router import AllProvidersExhausted, Router
+    from .client import DaemonClient, DaemonError, ProvidersExhausted
 
-    s = get_settings()
-    s.ensure_data_dir()
-    router = Router(BudgetLedger(), s)
+    client = DaemonClient()
     try:
-        result = await router.complete(
-            [Message("user", prompt)],
-            prefer="ollama" if local_brain else None,
-        )
-    except AllProvidersExhausted as exc:
-        print(f"no provider could answer: {exc}", file=sys.stderr)
+        # remember=False: a one-shot question is not a conversation, and the
+        # daemon must not be left with an empty session row per command.
+        result = await client.ask(prompt, remember=False,
+                                  prefer="ollama" if local_brain else None)
+    except ProvidersExhausted as exc:
+        print(str(exc), file=sys.stderr)
         return 1
+    except DaemonError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        await client.close()
     print(f"[{result.provider}/{result.model}  {result.latency_ms}ms]\n{result.text}")
     return 0
 

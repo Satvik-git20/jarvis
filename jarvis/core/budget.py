@@ -12,12 +12,14 @@ would throttle us before the provider actually would.
 
 from __future__ import annotations
 
-import json
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from ..storage import Database
+from ..storage.repositories import ProviderLogRepository, ProviderUsage
 
 
 @dataclass
@@ -77,15 +79,21 @@ class ProviderState:
 
 
 class BudgetLedger:
-    """Thread-safe quota accounting across the daemon's request handlers."""
+    """Quota accounting backed by transactional provider event logs.
+
+    The constructor accepts the historic ``budget.json`` path for backwards
+    compatibility. The file is imported once and the sibling ``jarvis.db`` is
+    authoritative from then on.
+    """
 
     def __init__(self, path: Path | None = None, limits: dict[str, Limits] | None = None):
         self._lock = threading.RLock()
         self._state: dict[str, ProviderState] = {}
         self._limits = limits if limits is not None else KNOWN_LIMITS
         self._path = path
-        if path:
-            self._load(path)
+        self._repository = ProviderLogRepository(Database(path)) if path else None
+        if path and path.suffix.lower() == ".json":
+            self._repository.import_legacy_json(path)
 
     # --- introspection ----------------------------------------------------
 
@@ -101,32 +109,31 @@ class BudgetLedger:
         now = time.time()
         st, lim = self.state(provider), self.limits(provider)
         st.prune(now)
-        tpm_used, tpd_used = st.token_totals()
+        usage = self._usage(provider, now)
+        manual_tpm, manual_tpd = st.token_totals()
         return {
-            "rpm": None if lim.rpm is None else max(0, lim.rpm - len(st.requests_min)),
-            "rpd": None if lim.rpd is None else max(0, lim.rpd - len(st.requests_day)),
-            "tpm": None if lim.tpm is None else max(0, lim.tpm - tpm_used),
-            "tpd": None if lim.tpd is None else max(0, lim.tpd - tpd_used),
+            "rpm": None if lim.rpm is None else max(0, lim.rpm - usage.requests_minute - len(st.requests_min)),
+            "rpd": None if lim.rpd is None else max(0, lim.rpd - usage.requests_day - len(st.requests_day)),
+            "tpm": None if lim.tpm is None else max(0, lim.tpm - usage.tokens_minute - manual_tpm),
+            "tpd": None if lim.tpd is None else max(0, lim.tpd - usage.tokens_day - manual_tpd),
         }
 
     def available(self, provider: str) -> bool:
         """Whether this provider can be tried right now."""
-        now = time.time()
-        st = self.state(provider)
-        with self._lock:
-            if st.cooldown_until > now:
-                return False
-            rem = self.remaining(provider)
+        if self.cooldown_for(provider) > 0:
+            return False
+        rem = self.remaining(provider)
         return all(v is None or v > 0 for v in rem.values())
 
     def cooldown_for(self, provider: str) -> float:
-        return max(0.0, self.state(provider).cooldown_until - time.time())
+        manual = self.state(provider).cooldown_until
+        return max(0.0, max(manual, self._usage(provider, time.time()).cooldown_until) - time.time())
 
     def exhausted(self, provider: str) -> str | None:
         """Which axis is spent, or None if the provider is usable."""
         now = time.time()
         st = self.state(provider)
-        if st.cooldown_until > now:
+        if max(st.cooldown_until, self._usage(provider, now).cooldown_until) > now:
             return "cooldown"
         rem = self.remaining(provider)
         for axis, val in rem.items():
@@ -137,19 +144,10 @@ class BudgetLedger:
     # --- mutation ---------------------------------------------------------
 
     def record(self, provider: str, tokens: int = 0) -> None:
-        now = time.time()
-        with self._lock:
-            st = self.state(provider)
-            st.requests_min.append(now)
-            st.requests_day.append(now)
-            if tokens:
-                st.tokens_min.append((now, tokens))
-                st.tokens_day.append((now, tokens))
-                st.total_tokens += tokens
-            st.total_requests += 1
-            st.last_used = now
-            st.cooldown_until = 0.0
-        self._persist()
+        if self._repository:
+            self._repository.record_completion(provider, tokens)
+            return
+        self._record_memory(provider, tokens)
 
     def penalize(self, provider: str, error: str, seconds: float = 60.0) -> None:
         """Put a provider in cooldown after a failure.
@@ -157,13 +155,13 @@ class BudgetLedger:
         429 and 402 mean the quota is gone, so back off far longer than a
         transient 500.
         """
-        now = time.time()
-        with self._lock:
-            st = self.state(provider)
-            st.errors += 1
-            st.last_error = error[:200]
-            st.cooldown_until = max(st.cooldown_until, now + seconds)
-        self._persist()
+        if self._repository:
+            self._repository.record_error(provider, error, time.time() + seconds)
+            return
+        st = self.state(provider)
+        st.errors += 1
+        st.last_error = error[:200]
+        st.cooldown_until = max(st.cooldown_until, time.time() + seconds)
 
     def reset(self, provider: str | None = None) -> None:
         with self._lock:
@@ -171,72 +169,47 @@ class BudgetLedger:
                 self._state.pop(provider, None)
             else:
                 self._state.clear()
-        self._persist()
+        if self._repository:
+            self._repository.clear(provider)
 
     # --- persistence ------------------------------------------------------
 
     def snapshot(self) -> dict:
-        with self._lock:
-            return {
-                p: {
-                    "total_requests": st.total_requests,
-                    "total_tokens": st.total_tokens,
-                    "errors": st.errors,
-                    "last_error": st.last_error,
-                    "cooldown_seconds": round(self.cooldown_for(p), 1),
-                    "remaining": self.remaining(p),
-                }
-                for p, st in self._state.items()
-            }
+        names = set(self._state)
+        if self._repository:
+            names.update(self._repository.providers())
+        return {
+            provider: self._snapshot_provider(provider)
+            for provider in names
+        }
 
-    def _persist(self) -> None:
-        """Counters and failure state survive restarts.
+    def _usage(self, provider: str, now: float):
+        if self._repository:
+            return self._repository.usage(provider, now=now)
+        # No path: pure in-memory mode. Rolling counters live in self._state
+        # and are added by the callers, so the durable slice is all zeros.
+        return ProviderUsage(0, 0, 0, 0, 0, 0, 0, "", 0.0)
 
-        Persisting last_error matters: when the router quietly falls over to a
-        different provider, the only way to find out why the preferred one was
-        skipped is its recorded error, and that is gone if the daemon restarts.
-        """
-        if not self._path:
-            return
-        with self._lock:
-            payload = {"saved_at": time.time(), "providers": {}}
-            for p, st in self._state.items():
-                cutoff = time.time() - 86_400
-                payload["providers"][p] = {
-                    "requests_day": [t for t in st.requests_day if t >= cutoff],
-                    "tokens_day": [[t, n] for t, n in st.tokens_day if t >= cutoff],
-                    "total_requests": st.total_requests,
-                    "total_tokens": st.total_tokens,
-                    "errors": st.errors,
-                    "last_error": st.last_error,
-                    "cooldown_until": st.cooldown_until,
-                    "last_used": st.last_used,
-                }
-        try:
-            self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(payload), "utf-8")
-        except OSError:
-            pass  # accounting is best-effort; never fail a request over it
+    def _snapshot_provider(self, provider: str) -> dict:
+        now = time.time()
+        usage, manual = self._usage(provider, now), self.state(provider)
+        return {
+            "total_requests": usage.total_requests + manual.total_requests,
+            "total_tokens": usage.total_tokens + manual.total_tokens,
+            "errors": usage.errors + manual.errors,
+            "last_error": usage.last_error or manual.last_error,
+            "cooldown_seconds": round(self.cooldown_for(provider), 1),
+            "remaining": self.remaining(provider),
+        }
 
-    def _load(self, path: Path) -> None:
-        try:
-            payload = json.loads(path.read_text("utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return
-        cutoff = time.time() - 86_400
-        for name, blob in (payload.get("providers") or {}).items():
-            st = ProviderState()
-            st.requests_day = deque(t for t in blob.get("requests_day", []) if t >= cutoff)
-            st.tokens_day = deque(
-                (float(t), int(n)) for t, n in blob.get("tokens_day", []) if t >= cutoff
-            )
-            st.total_requests = int(blob.get("total_requests", 0))
-            st.total_tokens = int(blob.get("total_tokens", 0))
-            st.errors = int(blob.get("errors", 0))
-            st.last_error = str(blob.get("last_error", ""))
-            st.last_used = float(blob.get("last_used", 0.0))
-            # A cooldown that outlived the restart would silently keep a
-            # recovered provider out of rotation, so drop expired ones and
-            # honour the rest.
-            st.cooldown_until = float(blob.get("cooldown_until", 0.0))
-            self._state[name] = st
+    def _record_memory(self, provider: str, tokens: int) -> None:
+        now, st = time.time(), self.state(provider)
+        st.requests_min.append(now)
+        st.requests_day.append(now)
+        if tokens:
+            st.tokens_min.append((now, tokens))
+            st.tokens_day.append((now, tokens))
+            st.total_tokens += tokens
+        st.total_requests += 1
+        st.last_used = now
+        st.cooldown_until = 0.0

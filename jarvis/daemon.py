@@ -7,14 +7,18 @@ one is not ceremony -- any web page your browser loads can issue requests to
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
+import sys
 import time
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from . import __version__
@@ -149,6 +153,19 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="JARVIS", version=__version__, lifespan=lifespan)
 auth = [Depends(require_token)]
 
+# Only the Chrome side-panel extension may read responses cross-origin.
+# Ordinary web pages can already *reach* this loopback port -- that was always
+# true -- but without matching CORS headers they cannot read a byte back, and
+# every state-changing route still demands X-Jarvis-Token either way.
+# Chrome extension ids are 32 characters from the range a-p.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"chrome-extension://[a-p]{32}",
+    allow_methods=["GET", "POST"],
+    allow_headers=["X-Jarvis-Token", "Content-Type"],
+    max_age=86_400,
+)
+
 
 # --- request models ---------------------------------------------------------
 
@@ -162,6 +179,8 @@ class AskRequest(BaseModel):
     temperature: float = 0.7
     max_tokens: int = 1024
     remember: bool = Field(default=True, description="Append the turn to session history")
+    timeout: float = Field(default=60.0, ge=1.0, le=600.0,
+                           description="Per-provider completion timeout in seconds")
 
 
 class SearchRequest(BaseModel):
@@ -201,13 +220,17 @@ async def status() -> dict[str, Any]:
 @app.post("/ask", dependencies=auth)
 async def ask(req: AskRequest) -> dict[str, Any]:
     st = get_state()
-    sid = st.sessions.get_or_create(req.session_id)
+    # Generate the id but do NOT insert a row yet: an unanswered or
+    # remember=false request must not leave an empty conversation behind.
+    # append() below creates the row as part of the turn transaction.
+    sid = req.session_id or f"s_{uuid.uuid4().hex[:12]}"
     msgs = st.sessions.history(sid, system=req.system)
     msgs.append(Message("user", req.prompt))
     try:
         result = await st.router.complete(
             msgs, prefer=req.prefer, model=req.model,
             temperature=req.temperature, max_tokens=req.max_tokens,
+            timeout=req.timeout,
         )
     except AllProvidersExhausted as exc:
         raise HTTPException(503, {
@@ -280,6 +303,30 @@ async def clear_session(session_id: str) -> dict[str, str]:
     return {"cleared": session_id}
 
 
+def _selector_loop() -> asyncio.AbstractEventLoop:
+    """A selector event loop, the one that survives failed accepts on Windows."""
+    return asyncio.SelectorEventLoop()
+
+
+def uvicorn_loop_setting() -> str:
+    """Loop setting passed to uvicorn.run().
+
+    uvicorn hard-codes ProactorEventLoop on Windows (uvicorn/loops/asyncio.py)
+    and an asyncio policy set beforehand is ignored, so the selector loop has
+    to be injected as a custom loop factory. The proactor accept path issues
+    one overlapped AcceptEx at a time and, when that accept fails (a client
+    reset in the accept queue -- WinError 64/10054), it stops re-arming: the
+    daemon then sits idle in GetQueuedCompletionStatus forever while new
+    connections pile up in the backlog, with nothing in the logs. The selector
+    loop drains the backlog in a loop and keeps its read handler armed across
+    a bad accept, so it heals. The daemon needs no proactor-only features (it
+    spawns no asyncio subprocesses).
+    """
+    if sys.platform == "win32":
+        return "jarvis.daemon:_selector_loop"
+    return "asyncio"
+
+
 def serve() -> None:
     import uvicorn
 
@@ -295,6 +342,7 @@ def serve() -> None:
         "jarvis.daemon:app",
         host=s.daemon_host,
         port=s.daemon_port,
+        loop=uvicorn_loop_setting(),
         log_level=os.environ.get("JARVIS_LOG_LEVEL", "warning"),
     )
 
